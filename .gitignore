@@ -1,0 +1,52 @@
+# Ignora artefatos de Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+terraform.tfvars
+*.tfvars.json
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
+
+# Ignora artefatos de Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Ambiente virtual local
+.venv/
+venv/
+env/
+
+# Arquivos de configuração locais/sensiveis
+.env
+.env.*
+
+# Cache de ferramentas
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Arquivos de IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Arquivos de sistema
+.DS_Store
+Thumbs.db
+
+
+
+.cursor/ß
+
