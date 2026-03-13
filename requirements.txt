@@ -1,0 +1,6 @@
+# Dependências da aplicação Python de movimentação S3
+# Adicionadas com aprovação do usuário.
+
+aiobotocore
+boto3
+dotenv
