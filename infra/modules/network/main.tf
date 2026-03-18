@@ -116,6 +116,10 @@ resource "aws_vpc_endpoint" "interface" {
   subnet_ids          = aws_subnet.private[*].id
   security_group_ids  = [aws_security_group.endpoints.id]
 
+  timeouts {
+    delete = "60m" // Deleção de ENIs pode demorar; aumenta timeout para reduzir falhas em destroy.
+  }
+
   tags = {
     Name        = "${var.project_name}-${each.key}-endpoint"
     Environment = "poc"

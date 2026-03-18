@@ -162,6 +162,10 @@ resource "aws_sfn_state_machine" "data_mover" {
 
   definition = local.state_machine_definition
 
+  timeouts {
+    delete = "60m" // State machine pode demorar para apagar; aumenta timeout para reduzir falhas no destroy.
+  }
+
   logging_configuration {
     include_execution_data = true
     level                  = "ALL"

@@ -117,6 +117,10 @@ No Console da AWS:
 
 ## Remover recursos
 
+> Importante: esta PoC foi configurada com `force_destroy`/`force_delete` para permitir remover **S3 (com objetos/versões)** e **ECR (com imagens)** sem travar.
+
+> Para garantir que a **VPC** e os **VPC Interface Endpoints** também sejam removidos, use `terraform destroy` no stack inteiro (não destrua só módulos isolados).
+
 ```bash
 terraform destroy
 ```
