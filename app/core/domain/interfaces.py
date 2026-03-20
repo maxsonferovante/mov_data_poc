@@ -35,3 +35,13 @@ class AsyncS3Port(Protocol):
         # Envia um stream de bytes para o S3 usando multipart upload
         ...
 
+    async def put_object_stream(
+        self,
+        bucket: str,
+        key: str,
+        data_stream: AsyncIterator[bytes],
+        content_type: str | None = None,
+    ) -> None:
+        # Envia um stream de bytes para o S3 com put_object
+        ...
+

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 import aiobotocore.session  # dependência externa aprovada pelo usuário
@@ -11,9 +12,38 @@ from app.core.domain.models import ObjectLocation
 class AiobotocoreS3Client(AsyncS3Port):
     # Implementação concreta da porta AsyncS3Port usando aiobotocore
 
-    def __init__(self, region_name: str | None = None) -> None:
+    def __init__(
+        self,
+        region_name: str | None = None,
+    ) -> None:
         self._session = aiobotocore.session.get_session()
         self._region_name = region_name
+        self._shared_client_cm = None
+        self._shared_client = None
+
+    async def __aenter__(self) -> "AiobotocoreS3Client":
+        # Reusa um único cliente S3 durante o ciclo da aplicação para reduzir overhead de conexão.
+        self._shared_client_cm = self._session.create_client(
+            "s3", region_name=self._region_name
+        )
+        self._shared_client = await self._shared_client_cm.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if self._shared_client_cm is not None:
+            await self._shared_client_cm.__aexit__(exc_type, exc, tb)
+        self._shared_client_cm = None
+        self._shared_client = None
+
+    @asynccontextmanager
+    async def _client_scope(self):
+        # Usa cliente compartilhado quando disponível; fallback para cliente temporário.
+        if self._shared_client is not None:
+            yield self._shared_client
+            return
+
+        async with self._session.create_client("s3", region_name=self._region_name) as client:
+            yield client
 
     async def list_objects(
         self,
@@ -21,7 +51,7 @@ class AiobotocoreS3Client(AsyncS3Port):
         prefix: str,
     ) -> AsyncIterator[ObjectLocation]:
         # Lista objetos de forma paginada usando list_objects_v2
-        async with self._session.create_client("s3", region_name=self._region_name) as client:
+        async with self._client_scope() as client:
             continuation_token: str | None = None
 
             while True:
@@ -37,7 +67,8 @@ class AiobotocoreS3Client(AsyncS3Port):
 
                 for item in response.get("Contents", []):
                     key = item["Key"]
-                    yield ObjectLocation(bucket=bucket, key=key)
+                    size_bytes = int(item.get("Size", 0))
+                    yield ObjectLocation(bucket=bucket, key=key, size_bytes=size_bytes)
 
                 if not response.get("IsTruncated"):
                     break
@@ -51,7 +82,7 @@ class AiobotocoreS3Client(AsyncS3Port):
         chunk_size: int,
     ) -> AsyncIterator[bytes]:
         # Faz streaming do corpo do objeto em chunks de tamanho fixo
-        async with self._session.create_client("s3", region_name=self._region_name) as client:
+        async with self._client_scope() as client:
             response = await client.get_object(Bucket=bucket, Key=key)
             body = response["Body"]
 
@@ -77,42 +108,12 @@ class AiobotocoreS3Client(AsyncS3Port):
         data_stream: AsyncIterator[bytes],
         content_type: str | None = None,
     ) -> None:
-        # Envia um stream de bytes para o S3 utilizando multipart upload
-        # Objetos pequenos são enviados em um único put_object para evitar EntityTooSmall.
-        MIN_PART_SIZE = 5 * 1024 * 1024  # 5MB, limite mínimo do S3 para partes (exceto a última)
-
-        async with self._session.create_client("s3", region_name=self._region_name) as client:
+        # Envia um stream de bytes para o S3 utilizando multipart upload sequencial.
+        async with self._client_scope() as client:
             extra_args: dict[str, object] = {}
             if content_type:
                 extra_args["ContentType"] = content_type
 
-            # Lê o primeiro chunk para decidir entre put simples e multipart
-            try:
-                first_chunk = await anext(data_stream)  # type: ignore[arg-type]
-            except StopAsyncIteration:
-                # Stream vazio, nada a enviar
-                return
-
-            if not first_chunk:
-                return
-
-            # Caso de objeto pequeno: faz put_object em uma única chamada
-            if len(first_chunk) < MIN_PART_SIZE:
-                chunks: list[bytes] = [first_chunk]
-                async for chunk in data_stream:
-                    if chunk:
-                        chunks.append(chunk)
-
-                body = b"".join(chunks)
-                await client.put_object(
-                    Bucket=bucket,
-                    Key=key,
-                    Body=body,
-                    **extra_args,
-                )
-                return
-
-            # Caso de objeto grande: segue com multipart upload
             create_resp = await client.create_multipart_upload(
                 Bucket=bucket,
                 Key=key,
@@ -123,23 +124,6 @@ class AiobotocoreS3Client(AsyncS3Port):
             part_number = 1
 
             try:
-                # Envia a primeira parte já lida
-                part_resp = await client.upload_part(
-                    Bucket=bucket,
-                    Key=key,
-                    PartNumber=part_number,
-                    UploadId=upload_id,
-                    Body=first_chunk,
-                )
-                parts.append(
-                    {
-                        "ETag": part_resp["ETag"],
-                        "PartNumber": part_number,
-                    }
-                )
-                part_number += 1
-
-                # Envia as demais partes do stream
                 async for chunk in data_stream:
                     if not chunk:
                         continue
@@ -180,4 +164,32 @@ class AiobotocoreS3Client(AsyncS3Port):
                     UploadId=upload_id,
                 )
                 raise
+
+    async def put_object_stream(
+        self,
+        bucket: str,
+        key: str,
+        data_stream: AsyncIterator[bytes],
+        content_type: str | None = None,
+    ) -> None:
+        # Envia stream com put_object consolidando o conteúdo em memória (uso para arquivos pequenos).
+        async with self._client_scope() as client:
+            body_chunks: list[bytes] = []
+            async for chunk in data_stream:
+                if chunk:
+                    body_chunks.append(chunk)
+
+            if not body_chunks:
+                return
+
+            extra_args: dict[str, object] = {}
+            if content_type:
+                extra_args["ContentType"] = content_type
+
+            await client.put_object(
+                Bucket=bucket,
+                Key=key,
+                Body=b"".join(body_chunks),
+                **extra_args,
+            )
 

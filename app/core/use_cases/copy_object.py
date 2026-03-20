@@ -2,6 +2,7 @@ from typing import AsyncIterator
 
 from app.core.domain.interfaces import AsyncS3Port
 from app.core.domain.models import BucketRef, CopyPlan, ObjectLocation
+from app.core.use_cases.copy_strategy_factory import CopyStrategyFactory
 
 
 def build_target_key(source_prefix: str, target_prefix: str, key: str) -> str:
@@ -22,11 +23,13 @@ class CopyObjectUseCase:
         source: BucketRef,
         target: BucketRef,
         chunk_size_bytes: int,
+        strategy_factory: CopyStrategyFactory | None = None,
     ) -> None:
         self._s3 = s3
         self._source = source
         self._target = target
         self._chunk_size_bytes = chunk_size_bytes
+        self._strategy_factory = strategy_factory or CopyStrategyFactory(s3=self._s3)
 
     def build_plan(self, obj: ObjectLocation) -> CopyPlan:
         # Cria o plano de cópia a partir do objeto de origem
@@ -41,22 +44,8 @@ class CopyObjectUseCase:
         )
 
     async def copy_one(self, obj: ObjectLocation) -> None:
-        # Executa a cópia de um objeto, fazendo o pipe leitura -> multipart upload
+        # Executa a cópia de um objeto usando Strategy + Factory por tamanho
         plan = self.build_plan(obj)
-
-        async def data_stream() -> AsyncIterator[bytes]:
-            # Pipe de leitura em chunks do objeto de origem
-            async for chunk in self._s3.stream_object(
-                bucket=plan.source.bucket,
-                key=plan.source.key,
-                chunk_size=self._chunk_size_bytes,
-            ):
-                yield chunk
-
-        # Envia o stream para o bucket de destino usando multipart upload
-        await self._s3.multipart_upload_stream(
-            bucket=plan.target.bucket,
-            key=plan.target.key,
-            data_stream=data_stream(),
-        )
+        strategy = self._strategy_factory.for_size(obj.size_bytes)
+        await strategy.copy(plan=plan, chunk_size_bytes=self._chunk_size_bytes)
 

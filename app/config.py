@@ -12,7 +12,9 @@ class AppConfig:
     source_prefix: str
     target_bucket: str
     target_prefix: str
-    max_concurrency: int
+    worker_count: int
+    queue_max_size: int
+    progress_log_every: int
     chunk_size_bytes: int
 
     @classmethod
@@ -39,10 +41,20 @@ class AppConfig:
         if not target_prefix.endswith("/"):
             target_prefix += "/"
 
-        # Define concorrência padrão e garante valor mínimo aceitável
-        max_concurrency = int(os.getenv("MAX_CONCURRENCY", "4"))
-        if max_concurrency < 1:
-            max_concurrency = 1
+        # Define número de workers e garante valor mínimo aceitável
+        worker_count = int(os.getenv("MAX_CONCURRENCY", "4"))
+        if worker_count < 1:
+            worker_count = 1
+
+        # Define tamanho máximo da fila de itens para os workers
+        queue_max_size = int(os.getenv("QUEUE_MAX_SIZE", str(worker_count * 2)))
+        if queue_max_size < 1:
+            queue_max_size = 1
+
+        # Define frequência do log agregado de progresso
+        progress_log_every = int(os.getenv("PROGRESS_LOG_EVERY", "40"))
+        if progress_log_every < 1:
+            progress_log_every = 1
 
         # Define tamanho do chunk em MB e converte para bytes
         chunk_mb = int(os.getenv("CHUNK_SIZE_MB", "8"))
@@ -55,7 +67,9 @@ class AppConfig:
             source_prefix=source_prefix,
             target_bucket=target_bucket,
             target_prefix=target_prefix,
-            max_concurrency=max_concurrency,
+            worker_count=worker_count,
+            queue_max_size=queue_max_size,
+            progress_log_every=progress_log_every,
             chunk_size_bytes=chunk_size_bytes,
         )
 

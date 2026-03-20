@@ -1,11 +1,11 @@
 import asyncio
 import logging
-from typing import AsyncIterator, Callable, Awaitable
+from typing import Callable, Optional
 
-from app.core.domain.interfaces import AsyncS3Port
 from app.core.domain.models import BucketRef, CopyStats, ObjectLocation
 from app.core.use_cases.copy_object import CopyObjectUseCase
 from app.core.use_cases.list_objects import ListObjectsToCopyUseCase
+from app.infra.aws.async_s3_client import AiobotocoreS3Client
 
 
 logger = logging.getLogger(__name__)
@@ -16,98 +16,128 @@ class CopyBatchUseCase:
 
     def __init__(
         self,
-        s3: AsyncS3Port,
+        s3_client_factory: Callable[[], AiobotocoreS3Client],
         source: BucketRef,
         target: BucketRef,
         max_concurrency: int,
         chunk_size_bytes: int,
-        retry_attempts: int = 3,
-        retry_backoff_base: float = 0.5,
+        queue_max_size: int = 100,
+        progress_log_every: int = 100,
     ) -> None:
-        self._s3 = s3
+        self._s3_client_factory = s3_client_factory
         self._source = source
         self._target = target
         self._max_concurrency = max_concurrency
         self._chunk_size_bytes = chunk_size_bytes
-        self._retry_attempts = retry_attempts
-        self._retry_backoff_base = retry_backoff_base
+        self._queue_max_size = max(1, queue_max_size)
+        self._progress_log_every = max(1, progress_log_every)
 
-    async def _retry(
+    async def _copy_one(
         self,
-        func: Callable[[], Awaitable[None]],
-        description: str,
-    ) -> None:
-        # Implementa retries simples com backoff exponencial
-        attempt = 0
-        while True:
-            try:
-                await func()
-                return
-            except Exception as exc:  # noqa: BLE001
-                attempt += 1
-                if attempt >= self._retry_attempts:
-                    logger.error(
-                        "Falha definitiva ao %s depois de %d tentativas: %s",
-                        description,
-                        attempt,
-                        exc,
-                    )
-                    raise
-                delay = self._retry_backoff_base * (2 ** (attempt - 1))
-                logger.warning(
-                    "Erro ao %s, tentativa %d/%d, aguardando %.2fs: %s",
-                    description,
-                    attempt,
-                    self._retry_attempts,
-                    delay,
-                    exc,
-                )
-                await asyncio.sleep(delay)
-
-    async def _worker(
-        self,
-        semaphore: asyncio.Semaphore,
+        copy_uc: CopyObjectUseCase,
         obj: ObjectLocation,
         stats: CopyStats,
     ) -> None:
-        # Worker responsável por copiar um único objeto com retry e logs de início/fim
-        copy_uc = CopyObjectUseCase(
-            s3=self._s3,
-            source=self._source,
-            target=self._target,
-            chunk_size_bytes=self._chunk_size_bytes,
-        )
+        # Copia um único item sem retry manual, com logs e coleta de resultado detalhado.
+        plan = copy_uc.build_plan(obj)
+        logger.debug("Iniciando cópia do objeto %s/%s", obj.bucket, obj.key)
+        try:
+            await copy_uc.copy_one(obj)
+        except Exception as exc:  # noqa: BLE001
+            stats.error_count += 1
+            logger.error("Falha ao copiar objeto %s/%s: %s", obj.bucket, obj.key, exc)
+            stats.failed_items.append(
+                {
+                    "source_key": plan.source.key,
+                    "target_key": plan.target.key,
+                    "size_bytes": obj.size_bytes,
+                    "error_message": str(exc),
+                }
+            )
+        else:
+            stats.success_count += 1
+            stats.total_bytes_moved += obj.size_bytes
+            stats.success_items.append(
+                {
+                    "source_key": plan.source.key,
+                    "target_key": plan.target.key,
+                    "size_bytes": obj.size_bytes,
+                }
+            )
+            logger.debug("Cópia concluída do objeto %s/%s", obj.bucket, obj.key)
 
-        async with semaphore:
-            logger.info("Iniciando cópia do objeto %s/%s", obj.bucket, obj.key)
-            try:
-                await self._retry(
-                    func=lambda: copy_uc.copy_one(obj),
-                    description=f"copiar objeto {obj.bucket}/{obj.key}",
-                )
-            except Exception:
-                stats.error_count += 1
-                logger.error("Falha ao copiar objeto %s/%s", obj.bucket, obj.key)
-            else:
-                stats.success_count += 1
-                logger.info("Cópia concluída do objeto %s/%s", obj.bucket, obj.key)
+        processed = stats.success_count + stats.error_count
+        if processed > 0 and processed % self._progress_log_every == 0:
+            logger.info(
+                "Progresso da cópia: processados=%d total=%d sucesso=%d erro=%d",
+                processed,
+                stats.total_objects,
+                stats.success_count,
+                stats.error_count,
+            )
+
+    async def _producer(
+        self,
+        queue: asyncio.Queue[Optional[ObjectLocation]],
+        stats: CopyStats,
+    ) -> None:
+        # Produz itens de cópia e publica sentinelas para encerrar workers
+        async with self._s3_client_factory() as producer_s3:
+            list_uc = ListObjectsToCopyUseCase(producer_s3, self._source)
+            async for obj in list_uc.execute():
+                stats.total_objects += 1
+                await queue.put(obj)
+
+        for _ in range(self._max_concurrency):
+            await queue.put(None)
+
+    async def _worker_loop(
+        self,
+        worker_id: int,
+        queue: asyncio.Queue[Optional[ObjectLocation]],
+        stats: CopyStats,
+    ) -> None:
+        # Worker consome fila até receber sentinela
+        async with self._s3_client_factory() as worker_s3:
+            copy_uc = CopyObjectUseCase(
+                s3=worker_s3,
+                source=self._source,
+                target=self._target,
+                chunk_size_bytes=self._chunk_size_bytes,
+            )
+
+            while True:
+                item = await queue.get()
+                if item is None:
+                    queue.task_done()
+                    logger.debug("Worker %d encerrado.", worker_id)
+                    return
+
+                try:
+                    await self._copy_one(copy_uc, item, stats)
+                finally:
+                    queue.task_done()
 
     async def run(self) -> CopyStats:
-        # Orquestra a listagem e a cópia concorrente dos objetos
-        list_uc = ListObjectsToCopyUseCase(self._s3, self._source)
+        # Orquestra listagem e cópia em modelo produtor-consumidor com fila assíncrona
         stats = CopyStats()
-        semaphore = asyncio.Semaphore(self._max_concurrency)
-        tasks: list[asyncio.Task[None]] = []
+        queue: asyncio.Queue[Optional[ObjectLocation]] = asyncio.Queue(
+            maxsize=self._queue_max_size
+        )
 
-        async for obj in list_uc.execute():
-            stats.total_objects += 1
-            task = asyncio.create_task(self._worker(semaphore, obj, stats))
-            tasks.append(task)
+        producer_task = asyncio.create_task(self._producer(queue, stats))
+        worker_tasks = [
+            asyncio.create_task(self._worker_loop(idx + 1, queue, stats))
+            for idx in range(self._max_concurrency)
+        ]
 
-        if not tasks:
+        await producer_task
+        if stats.total_objects == 0:
             logger.info("Nenhum objeto encontrado para o prefixo informado.")
+            await asyncio.gather(*worker_tasks, return_exceptions=False)
             return stats
 
-        await asyncio.gather(*tasks, return_exceptions=False)
+        await queue.join()
+        await asyncio.gather(*worker_tasks, return_exceptions=False)
         return stats
 
